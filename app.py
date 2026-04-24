@@ -3,6 +3,8 @@ import pickle
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, db
+import os
+import json
 
 app = Flask(__name__)
 
@@ -13,9 +15,15 @@ with open("model.pkl", "rb") as f:
     model = pickle.load(f)
 
 # ==================================================
-# Firebase Setup
+# Firebase Setup using Render Environment Variable
 # ==================================================
-cred = credentials.Certificate("serviceAccountKey.json")
+firebase_json = os.environ.get("FIREBASE_CREDENTIALS")
+
+if not firebase_json:
+    raise ValueError("FIREBASE_CREDENTIALS environment variable not found")
+
+cred_dict = json.loads(firebase_json)
+cred = credentials.Certificate(cred_dict)
 
 firebase_admin.initialize_app(cred, {
     "databaseURL": "https://smart-irrigation-c801b-default-rtdb.asia-southeast1.firebasedatabase.app"
@@ -75,11 +83,15 @@ def process():
 
         # ==========================================
         # Read Aggregated Values
-        # (IMPORTANT: now using aggregated values)
         # ==========================================
         aggregated = latest_data["aggregated"]
 
-        soil_moisture = aggregated["soil_misture"] if "soil_misture" in aggregated else aggregated["soil_moisture"]
+        # Handle typo safety if soil_misture exists
+        soil_moisture = aggregated.get(
+            "soil_moisture",
+            aggregated.get("soil_misture")
+        )
+
         temperature = aggregated["temperature"]
         humidity = aggregated["humidity"]
         days = aggregated["days_since_last_watering"]
@@ -161,7 +173,7 @@ def process():
         # ==========================================
         # Flask Logic for FINAL Prediction
         #
-        # if stress not improving
+        # If stress not improving
         # for 3+ watering cycles
         #
         # → Problem
@@ -170,13 +182,13 @@ def process():
         final_label = model_label
 
         if model_prediction == 0:
-            # Healthy → Reset everything
+            # Healthy → Reset counter
             failed_recovery_count = 0
             final_prediction = 0
             final_label = "Healthy"
 
         else:
-            # Needs Water → compare stress
+            # Needs Water → Compare stress
 
             if stress_index >= last_stress_index:
                 failed_recovery_count += 1
@@ -211,7 +223,8 @@ def process():
             "failed_recovery_count": failed_recovery_count,
             "last_stress_index": stress_index,
             "last_health_state": final_label,
-            "last_improved_at": latest_key if final_prediction == 0 else plant_status.get("last_improved_at", latest_key)
+            "last_improved_at": latest_key if final_prediction == 0
+            else plant_status.get("last_improved_at", latest_key)
         })
 
         # ==========================================
