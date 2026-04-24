@@ -5,6 +5,7 @@ import firebase_admin
 from firebase_admin import credentials, db
 import os
 import json
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -28,6 +29,28 @@ cred = credentials.Certificate(cred_dict)
 firebase_admin.initialize_app(cred, {
     "databaseURL": "https://smart-irrigation-c801b-default-rtdb.asia-southeast1.firebasedatabase.app"
 })
+
+# ==================================================
+# Helper Function
+# Calculate days since last watering
+# ==================================================
+def calculate_days_since_last_watering(last_watered_at):
+    try:
+        # Format: DDMMYYYYHHMMSS
+        last_watered_date = datetime.strptime(
+            last_watered_at,
+            "%d%m%Y%H%M%S"
+        )
+
+        current_date = datetime.now()
+
+        difference = current_date - last_watered_date
+
+        return difference.days
+
+    except:
+        return 0
+
 
 # ==================================================
 # Home Route
@@ -57,6 +80,14 @@ def home():
 #   2 = Problem
 #
 # based on failed_recovery_count
+#
+# IMPORTANT:
+# ESP updates:
+#   no_of_times_watered
+#   last_watered_at
+#
+# Flask calculates:
+#   days_since_last_watering
 # ==================================================
 @app.route("/process", methods=["GET"])
 def process():
@@ -82,11 +113,54 @@ def process():
         latest_data = all_data[latest_key]
 
         # ==========================================
+        # Read plant_status first
+        # because:
+        # no_of_times_watered + last_watered_at
+        # are stored there now
+        # ==========================================
+        status_path = "Live_readings/plant_status/plant_1"
+        status_ref = db.reference(status_path)
+
+        plant_status = status_ref.get()
+
+        if not plant_status:
+            plant_status = {
+                "no_of_times_watered": 0,
+                "last_watered_at": latest_key,
+                "failed_recovery_count": 0,
+                "last_stress_index": 0.0,
+                "last_health_state": "Healthy",
+                "last_improved_at": latest_key
+            }
+
+        no_of_times_watered = plant_status.get(
+            "no_of_times_watered", 0
+        )
+
+        last_watered_at = plant_status.get(
+            "last_watered_at", latest_key
+        )
+
+        failed_recovery_count = plant_status.get(
+            "failed_recovery_count", 0
+        )
+
+        last_stress_index = plant_status.get(
+            "last_stress_index", 0.0
+        )
+
+        # ==========================================
+        # Flask calculates this dynamically
+        # ==========================================
+        days_since_last_watering = calculate_days_since_last_watering(
+            last_watered_at
+        )
+
+        # ==========================================
         # Read Aggregated Values
         # ==========================================
         aggregated = latest_data["aggregated"]
 
-        # Handle typo safety if soil_misture exists
         soil_moisture = aggregated.get(
             "soil_moisture",
             aggregated.get("soil_misture")
@@ -94,8 +168,6 @@ def process():
 
         temperature = aggregated["temperature"]
         humidity = aggregated["humidity"]
-        days = aggregated["days_since_last_watering"]
-        times = aggregated["no_of_times_watered"]
 
         R = aggregated["R"]
         G = aggregated["G"]
@@ -111,14 +183,26 @@ def process():
         green_ratio = G / (R + B)
 
         # ==========================================
+        # Update aggregated node with
+        # calculated days_since_last_watering
+        # ==========================================
+        aggregated_ref = db.reference(
+            f"{plant_path}/{latest_key}/aggregated"
+        )
+
+        aggregated_ref.update({
+            "days_since_last_watering": days_since_last_watering
+        })
+
+        # ==========================================
         # Create DataFrame
         # ==========================================
         features = pd.DataFrame([{
-            "soil_moisture": soil_moisture,
+            "soil_moisture": soil_misture,
             "temperature": temperature,
             "humidity": humidity,
-            "days_since_last_watering": days,
-            "no_of_times_watered": times,
+            "days_since_last_watering": days_since_last_watering,
+            "no_of_times_watered": no_of_times_watered,
             "R": R,
             "G": G,
             "B": B,
@@ -130,6 +214,7 @@ def process():
 
         # ==========================================
         # Model Prediction
+        #
         # ONLY:
         # 0 = Healthy
         # 1 = Needs Water
@@ -144,30 +229,6 @@ def process():
         model_label = model_label_map.get(
             model_prediction,
             "Needs Water"
-        )
-
-        # ==========================================
-        # Read plant_status
-        # ==========================================
-        status_path = "plant_status/plant_1"
-        status_ref = db.reference(status_path)
-
-        plant_status = status_ref.get()
-
-        if not plant_status:
-            plant_status = {
-                "failed_recovery_count": 0,
-                "last_stress_index": stress_index,
-                "last_health_state": "Healthy",
-                "last_improved_at": latest_key
-            }
-
-        failed_recovery_count = plant_status.get(
-            "failed_recovery_count", 0
-        )
-
-        last_stress_index = plant_status.get(
-            "last_stress_index", stress_index
         )
 
         # ==========================================
@@ -188,7 +249,7 @@ def process():
             final_label = "Healthy"
 
         else:
-            # Needs Water → Compare stress
+            # Needs Water → compare stress
 
             if stress_index >= last_stress_index:
                 failed_recovery_count += 1
@@ -263,6 +324,9 @@ def process():
 
             "final_prediction": final_prediction,
             "final_label": final_label,
+
+            "days_since_last_watering": days_since_last_watering,
+            "no_of_times_watered": no_of_times_watered,
 
             "failed_recovery_count": failed_recovery_count,
             "pump_state": pump_state
