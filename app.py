@@ -198,7 +198,7 @@ def process():
         # Create DataFrame
         # ==========================================
         features = pd.DataFrame([{
-            "soil_moisture": soil_misture,
+            "soil_moisture": soil_moisture,
             "temperature": temperature,
             "humidity": humidity,
             "days_since_last_watering": days_since_last_watering,
