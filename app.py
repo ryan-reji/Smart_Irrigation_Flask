@@ -163,7 +163,7 @@ def process():
 
         soil_moisture = aggregated.get(
             "soil_moisture",
-            aggregated.get("soil_misture")
+            aggregated.get("soil_moisture")
         )
 
         temperature = aggregated["temperature"]
