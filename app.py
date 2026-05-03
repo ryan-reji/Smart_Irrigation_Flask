@@ -32,92 +32,59 @@ firebase_admin.initialize_app(cred, {
 
 # ==================================================
 # Helper Function
-# Calculate days since last watering
 # ==================================================
 def calculate_days_since_last_watering(last_watered_at):
     try:
-        # Format: DDMMYYYYHHMMSS
         last_watered_date = datetime.strptime(
             last_watered_at,
             "%d%m%Y%H%M%S"
         )
-
         current_date = datetime.now()
-
         difference = current_date - last_watered_date
-
         return difference.days
-
     except:
         return 0
 
 
-# ==================================================
-# Home Route
-# ==================================================
 @app.route("/")
 def home():
     return "Smart Irrigation API Running"
 
 
-# ==================================================
-# Process Latest Plant Reading
-#
-# Reads:
-# Live_readings/plants/plant_1/latest_timestamp
-#
-# Updates:
-# prediction/
-# pump_control/
-# plant_status/
-#
-# Logic:
-# Model predicts:
-#   0 = Healthy
-#   1 = Needs Water
-#
-# Flask decides:
-#   2 = Problem
-#
-# based on failed_recovery_count
-#
-# IMPORTANT:
-# ESP updates:
-#   no_of_times_watered
-#   last_watered_at
-#
-# Flask calculates:
-#   days_since_last_watering
-# ==================================================
 @app.route("/process", methods=["GET"])
 def process():
     try:
 
-        # ==========================================
-        # Firebase Plant Path
-        # ==========================================
         plant_path = "Live_readings/plants/plant_1"
         plant_ref = db.reference(plant_path)
 
         all_data = plant_ref.get()
 
         if not all_data:
-            return jsonify({
-                "error": "No plant data found"
-            }), 404
+            return jsonify({"error": "No plant data found"}), 404
 
-        # ==========================================
-        # Get Latest Timestamp Node
-        # ==========================================
-        latest_key = sorted(all_data.keys())[-1]
+        # ==================================================
+        # ✅ FIXED: Proper latest timestamp selection
+        # ==================================================
+        valid_items = []
+
+        for k, v in all_data.items():
+            if k.isdigit() and isinstance(v, dict) and "aggregated" in v:
+                try:
+                    dt = datetime.strptime(k, "%d%m%Y%H%M%S")
+                    valid_items.append((dt, k))
+                except:
+                    continue
+
+        if not valid_items:
+            return jsonify({"error": "No valid data with aggregated"}), 400
+
+        latest_key = sorted(valid_items)[-1][1]
         latest_data = all_data[latest_key]
 
-        # ==========================================
-        # Read plant_status first
-        # because:
-        # no_of_times_watered + last_watered_at
-        # are stored there now
-        # ==========================================
+        # ==================================================
+        # Plant Status
+        # ==================================================
         status_path = "Live_readings/plant_status/plant_1"
         status_ref = db.reference(status_path)
 
@@ -133,59 +100,39 @@ def process():
                 "last_improved_at": latest_key
             }
 
-        no_of_times_watered = plant_status.get(
-            "no_of_times_watered", 0
-        )
+        no_of_times_watered = plant_status.get("no_of_times_watered", 0)
+        last_watered_at = plant_status.get("last_watered_at", latest_key)
+        failed_recovery_count = plant_status.get("failed_recovery_count", 0)
+        last_stress_index = plant_status.get("last_stress_index", 0.0)
 
-        last_watered_at = plant_status.get(
-            "last_watered_at", latest_key
-        )
-
-        failed_recovery_count = plant_status.get(
-            "failed_recovery_count", 0
-        )
-
-        last_stress_index = plant_status.get(
-            "last_stress_index", 0.0
-        )
-
-        # ==========================================
-        # Flask calculates this dynamically
-        # ==========================================
         days_since_last_watering = calculate_days_since_last_watering(
             last_watered_at
         )
 
-        # ==========================================
-        # Read Aggregated Values
-        # ==========================================
-        aggregated = latest_data["aggregated"]
+        # ==================================================
+        # ✅ FIXED: Safe aggregated access
+        # ==================================================
+        aggregated = latest_data.get("aggregated")
 
-        soil_moisture = aggregated.get(
-            "soil_moisture",
-            aggregated.get("soil_moisture")
-        )
+        if not aggregated:
+            return jsonify({"error": "Aggregated data missing"}), 400
 
-        temperature = aggregated["temperature"]
-        humidity = aggregated["humidity"]
+        soil_moisture = aggregated.get("soil_moisture", 0)
+        temperature = aggregated.get("temperature", 0)
+        humidity = aggregated.get("humidity", 0)
 
-        R = aggregated["R"]
-        G = aggregated["G"]
-        B = aggregated["B"]
+        R = aggregated.get("R", 0)
+        G = aggregated.get("G", 0)
+        B = aggregated.get("B", 0)
 
-        # ==========================================
+        # ==================================================
         # Feature Engineering
-        # Must match training exactly
-        # ==========================================
+        # ==================================================
         G_minus_R = G - R
         G_minus_B = G - B
-        stress_index = abs(G - R) / (G + R)
-        green_ratio = G / (R + B)
+        stress_index = abs(G - R) / (G + R) if (G + R) != 0 else 0
+        green_ratio = G / (R + B) if (R + B) != 0 else 0
 
-        # ==========================================
-        # Update aggregated node with
-        # calculated days_since_last_watering
-        # ==========================================
         aggregated_ref = db.reference(
             f"{plant_path}/{latest_key}/aggregated"
         )
@@ -194,9 +141,6 @@ def process():
             "days_since_last_watering": days_since_last_watering
         })
 
-        # ==========================================
-        # Create DataFrame
-        # ==========================================
         features = pd.DataFrame([{
             "soil_moisture": soil_moisture,
             "temperature": temperature,
@@ -212,13 +156,6 @@ def process():
             "green_ratio": green_ratio
         }])
 
-        # ==========================================
-        # Model Prediction
-        #
-        # ONLY:
-        # 0 = Healthy
-        # 1 = Needs Water
-        # ==========================================
         model_prediction = int(model.predict(features)[0])
 
         model_label_map = {
@@ -231,26 +168,14 @@ def process():
             "Needs Water"
         )
 
-        # ==========================================
-        # Flask Logic for FINAL Prediction
-        #
-        # If stress not improving
-        # for 3+ watering cycles
-        #
-        # → Problem
-        # ==========================================
         final_prediction = model_prediction
         final_label = model_label
 
         if model_prediction == 0:
-            # Healthy → Reset counter
             failed_recovery_count = 0
             final_prediction = 0
             final_label = "Healthy"
-
         else:
-            # Needs Water → compare stress
-
             if stress_index >= last_stress_index:
                 failed_recovery_count += 1
             else:
@@ -263,9 +188,6 @@ def process():
                 final_prediction = 1
                 final_label = "Needs Water"
 
-        # ==========================================
-        # Write Prediction Back
-        # ==========================================
         prediction_ref = db.reference(
             f"{plant_path}/{latest_key}/prediction"
         )
@@ -277,9 +199,6 @@ def process():
             "final_label": final_label
         })
 
-        # ==========================================
-        # Update plant_status
-        # ==========================================
         status_ref.update({
             "failed_recovery_count": failed_recovery_count,
             "last_stress_index": stress_index,
@@ -288,54 +207,30 @@ def process():
             else plant_status.get("last_improved_at", latest_key)
         })
 
-        # ==========================================
-        # Pump Control
-        #
-        # Needs Water → ON
-        # Healthy → OFF
-        # Problem → OFF
-        #
-        # ESP handles:
-        # ON → 10 sec → OFF
-        # ==========================================
-        if final_prediction == 1:
-            pump_state = "ON"
-        else:
-            pump_state = "OFF"
+        pump_state = "ON" if final_prediction == 1 else "OFF"
 
-        pump_ref = db.reference(
-            "Live_readings/pump_control"
-        )
+        pump_ref = db.reference("Live_readings/pump_control")
 
         pump_ref.update({
             "state": pump_state,
             "last_updated_at": latest_key
         })
 
-        # ==========================================
-        # Final Response
-        # ==========================================
         return jsonify({
             "status": "success",
             "latest_timestamp": latest_key,
-
             "model_prediction": model_prediction,
             "model_label": model_label,
-
             "final_prediction": final_prediction,
             "final_label": final_label,
-
             "days_since_last_watering": days_since_last_watering,
             "no_of_times_watered": no_of_times_watered,
-
             "failed_recovery_count": failed_recovery_count,
             "pump_state": pump_state
         })
 
     except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
