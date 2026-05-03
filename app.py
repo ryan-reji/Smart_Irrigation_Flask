@@ -233,5 +233,24 @@ def process():
         return jsonify({"error": str(e)}), 500
 
 
+# ==================================================
+# FUTURE ENHANCEMENT: Background Worker (COMMENTED)
+# ==================================================
+# import threading
+# import time
+#
+# def background_worker():
+#     while True:
+#         try:
+#             with app.app_context():
+#                 process()
+#         except Exception as e:
+#             print("Background error:", e)
+#
+#         time.sleep(10)
+#
+# threading.Thread(target=background_worker, daemon=True).start()
+
+
 if __name__ == "__main__":
     app.run(debug=True)
